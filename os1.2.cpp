@@ -4,68 +4,63 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <signal.h>
 #include <aio.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <stdint.h>
 #include <inttypes.h>
 #include <time.h>
-#include <signal.h>
 #include <pthread.h>
 
 #include <iostream>
 #include <string>
 #include <atomic>
 
-// ── tunables ──────────────────────────────────────────────────────────────
 static const int CLUSTER   = 4096;
 static const int MAX_SLOTS = 64;
 
-// ── per-operation descriptor ──────────────────────────────────────────────
+// описатель одной асинхронной операции
 struct aio_operation {
     struct aiocb  aio;
     char         *buffer;
-    int           write_operation; // 0 = read, 1 = write
-    void         *next_operation;  // reserved
+    int           write_operation; // 0 = чтение, 1 = запись
+    void         *next_operation;
     int           slot;
     off_t         offset;
-    ssize_t       bytes;           // result of aio_return (called exactly once)
+    ssize_t       bytes; // результат aio_return, вызывается ровно один раз
 };
 
-// ── global copy state (reset before each copy) ────────────────────────────
 static int   g_fd_src   = -1;
 static int   g_fd_dst   = -1;
 static off_t g_filesize = 0;
 
 static int g_block_size = CLUSTER;
 static int g_n_slots    = 1;
-
 static long g_total_blocks = 0;
 
-static std::atomic<long> g_next_block(0);  // next block index to read
-static std::atomic<long> g_done_writes(0); // number of completed writes
+static std::atomic<long> g_next_block(0);  // следующий блок для чтения
+static std::atomic<long> g_done_writes(0); // счётчик завершённых записей
 
-// mutex+condvar used to signal main thread when all writes are done
-static pthread_mutex_t g_mtx     = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t  g_cond    = PTHREAD_COND_INITIALIZER;
+// главный поток ждёт на этом кондваре
+static pthread_mutex_t g_mtx      = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_cond     = PTHREAD_COND_INITIALIZER;
 static volatile int    g_finished = 0;
 
 static aio_operation *g_rops = nullptr;
 static aio_operation *g_wops = nullptr;
 
-// ── forward declaration ───────────────────────────────────────────────────
 static void launch_read(int slot, long block_idx);
 
-// ── completion callback (called by kernel via SIGEV_THREAD) ───────────────
+// вызывается ядром по завершении любой асинхронной операции
 void aio_completion_handler(sigval_t sv)
 {
     aio_operation *op = (aio_operation *)sv.sival_ptr;
     int slot = op->slot;
 
-    op->bytes = aio_return(&op->aio); // must be called exactly once
+    op->bytes = aio_return(&op->aio);
 
     if (op->write_operation) {
-        // write done: signal if last block, otherwise kick next read
         long done = ++g_done_writes;
         if (done >= g_total_blocks) {
             pthread_mutex_lock(&g_mtx);
@@ -74,11 +69,12 @@ void aio_completion_handler(sigval_t sv)
             pthread_mutex_unlock(&g_mtx);
             return;
         }
+        // запускаем следующее чтение в том же слоте
         long next = g_next_block.fetch_add(1);
         if (next < g_total_blocks)
             launch_read(slot, next);
     } else {
-        // read done: issue write for the same slot using the same buffer
+        // чтение готово, запускаем запись в тот же буфер
         aio_operation *wop = &g_wops[slot];
         memset(&wop->aio, 0, sizeof(struct aiocb));
         wop->aio.aio_fildes  = g_fd_dst;
@@ -99,11 +95,11 @@ void aio_completion_handler(sigval_t sv)
     }
 }
 
-// ── issue async read for one block ────────────────────────────────────────
 static void launch_read(int slot, long block_idx)
 {
     off_t  offset  = (off_t)block_idx * g_block_size;
     size_t to_read = (size_t)g_block_size;
+    // последний блок может быть короче
     if (offset + (off_t)to_read > g_filesize)
         to_read = (size_t)(g_filesize - offset);
 
@@ -126,7 +122,6 @@ static void launch_read(int slot, long block_idx)
         perror("aio_read");
 }
 
-// ── copy src→dst, return elapsed ms (-1 on error) ─────────────────────────
 static int64_t do_copy(const char *src, const char *dst)
 {
     g_fd_src = open(src, O_RDONLY | O_NONBLOCK);
@@ -135,7 +130,11 @@ static int64_t do_copy(const char *src, const char *dst)
     struct stat st;
     fstat(g_fd_src, &st);
     g_filesize = st.st_size;
-    if (g_filesize == 0) { fprintf(stderr, "source file is empty\n"); close(g_fd_src); return -1; }
+    if (g_filesize == 0) {
+        fprintf(stderr, "source file is empty\n");
+        close(g_fd_src);
+        return -1;
+    }
 
     g_fd_dst = open(dst, O_CREAT | O_WRONLY | O_TRUNC | O_NONBLOCK, 0666);
     if (g_fd_dst < 0) { perror("open dst"); close(g_fd_src); return -1; }
@@ -156,12 +155,11 @@ static int64_t do_copy(const char *src, const char *dst)
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
-    // start initial reads, one per slot (up to total_blocks)
+    // запускаем первые чтения, по одному на слот
     int first = (g_n_slots < (int)g_total_blocks) ? g_n_slots : (int)g_total_blocks;
     for (int i = 0; i < first; i++)
         launch_read(i, g_next_block.fetch_add(1));
 
-    // block main thread until all writes finish
     pthread_mutex_lock(&g_mtx);
     while (!g_finished)
         pthread_cond_wait(&g_cond, &g_mtx);
@@ -181,7 +179,6 @@ static int64_t do_copy(const char *src, const char *dst)
     return ms;
 }
 
-// ── helpers ───────────────────────────────────────────────────────────────
 static double file_mb(const char *path)
 {
     struct stat st; stat(path, &st);
@@ -194,15 +191,14 @@ static void print_menu()
     printf("  AIO File Copy  |  block=%d B  slots=%d\n", g_block_size, g_n_slots);
     printf("=========================================\n");
     printf("  1. Copy file\n");
-    printf("  2. Set block size (cluster multiples)\n");
-    printf("  3. Set parallel slot count\n");
+    printf("  2. Set block size\n");
+    printf("  3. Set slot count\n");
     printf("  4. Experiment: speed vs block size\n");
     printf("  5. Experiment: speed vs slot count\n");
     printf("  0. Exit\n");
     printf("Choice: ");
 }
 
-// ── menu actions ──────────────────────────────────────────────────────────
 static void menu_copy()
 {
     std::string src, dst;
@@ -232,8 +228,8 @@ static void menu_set_slots()
 static void menu_exp_block()
 {
     std::string src, dst;
-    std::cout << "Source: "; std::cin >> src;
-    std::cout << "Dest  : "; std::cin >> dst;
+    std::cout << "Source file : "; std::cin >> src;
+    std::cout << "Dest file   : "; std::cin >> dst;
 
     int saved_b = g_block_size, saved_s = g_n_slots;
     g_n_slots = 1;
@@ -243,7 +239,6 @@ static void menu_exp_block()
     double fmb = file_mb(src.c_str());
 
     printf("\n%-18s  %-10s  %-12s\n", "Block size (B)", "Time (ms)", "Speed (MB/s)");
-    printf("%-18s  %-10s  %-12s\n", "------------------","----------","------------");
 
     int best_m = 1; double best_spd = 0;
     for (int i = 0; i < nm; i++) {
@@ -263,8 +258,8 @@ static void menu_exp_block()
 static void menu_exp_slots()
 {
     std::string src, dst;
-    std::cout << "Source: "; std::cin >> src;
-    std::cout << "Dest  : "; std::cin >> dst;
+    std::cout << "Source file : "; std::cin >> src;
+    std::cout << "Dest file   : "; std::cin >> dst;
     int mult; printf("Block cluster multiplier: "); scanf("%d", &mult);
     g_block_size = (mult < 1 ? 1 : mult) * CLUSTER;
 
@@ -274,7 +269,6 @@ static void menu_exp_slots()
     double fmb = file_mb(src.c_str());
 
     printf("\n%-10s  %-10s  %-12s\n", "Slots", "Time (ms)", "Speed (MB/s)");
-    printf("%-10s  %-10s  %-12s\n", "----------","----------","------------");
 
     int best_n = 1; double best_spd = 0;
     for (int i = 0; i < nl; i++) {
@@ -290,11 +284,10 @@ static void menu_exp_slots()
     g_n_slots = saved_s;
 }
 
-// ── main ──────────────────────────────────────────────────────────────────
 int main()
 {
     int ch;
-    while (true) {
+    do {
         print_menu();
         if (scanf("%d", &ch) != 1) break;
         switch (ch) {
@@ -303,8 +296,8 @@ int main()
             case 3: menu_set_slots(); break;
             case 4: menu_exp_block(); break;
             case 5: menu_exp_slots(); break;
-            case 0: puts("Bye."); return 0;
+            case 0: puts("Bye.");     break;
             default: puts("Unknown option.");
         }
-    }
+    } while (ch != 0);
 }
