@@ -1,21 +1,12 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <signal.h>
-#include <aio.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <stdint.h>
-#include <inttypes.h>
-#include <time.h>
-#include <pthread.h>
-
-#include <iostream>
-#include <string>
-#include <atomic>
+#include <stdio.h>      
+#include <stdlib.h>     
+#include <string.h>     
+#include <fcntl.h>      
+#include <unistd.h>     
+#include <sys/mman.h>   
+#include <sys/stat.h>   
+#include <sys/time.h>   
+#include <sys/select.h> 
 
 static const int CLUSTER   = 4096;
 static const int MAX_SLOTS = 64;
